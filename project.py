@@ -29,8 +29,9 @@ from urllib.request import urlopen
 
 WORD_RE = re.compile(r"[A-Za-z0-9']+(?:-[A-Za-z0-9']+)*")
 TAGALOG_LINE_RE = re.compile(r"^T:\s*(.+)$")
+
 ENGLISH_WORDS_URL = "https://raw.githubusercontent.com/dwyl/english-words/master/words_alpha.txt"
-TAGALOG_SOURCE_URL = "https://raw.githubusercontent.com/jhellingman/phildict/master/Data/Calderon/EST-content-1.0.txt"
+TAGALOG_SOURCE_URL = "https://raymelon.github.io/tagalog-dictionary-scraper/tagalog_dict.txt"
 CACHE_DIR = Path(__file__).resolve().parent / "data_cache"
 CACHE_DIR.mkdir(exist_ok=True)
 ENGLISH_CACHE_PATH = CACHE_DIR / "english_words.txt"
@@ -91,66 +92,61 @@ def dice_coefficient(left: str, right: str) -> float:
 
 
 def filipino_phonetic_code(word: str) -> str:
+	"""Conservative Filipino/Taglish phonetic normalization.
+
+	Goal: help rank *plausible* orthographic variants without collapsing many
+	different words into the same code.
+	"""
 	code = word.lower()
+
+	# Keep only very common spelling->sound variants.
 	for source, target in (
 		("ph", "f"),
 		("qu", "k"),
 		("cw", "k"),
 		("x", "ks"),
-		("c", "k"),
-		("q", "k"),
 		("v", "b"),
 		("z", "s"),
-		("j", "h"),
 	):
 		code = code.replace(source, target)
-	code = re.sub(r"(?:si|sy|siy|sio|sion|syon|tion)$", "syon", code)
+
+	# Keep ending normalization minimal: only normalize explicit "tion".
+	code = re.sub(r"tion$", "syon", code)
+
+	# Remove silent/inserted 'h' when it precedes a consonant.
 	code = re.sub(r"h(?=[bcdfghjklmnpqrstvwxyz])", "", code)
-	code = re.sub(r"(.)\1+", r"\1", code)
+
+	# Collapse repeated letters, but do it conservatively.
+	# (Avoid turning "mm"/"nn"-type legitimate patterns into too-short codes.)
+	code = re.sub(r"(.)\1{2,}", r"\1\1", code)
 	return code
 
 
+
+
 def filipino_stem(word: str) -> str:
+	"""Conservative stemming.
+
+	The current aggressive affix stripping can destroy correct Tagalog stems,
+	causing the checker to propose wrong words.
+
+	We only normalize the token minimally here; longer/true morphology should
+	come from better rules + lexicon coverage.
+	"""
 	stem = word.lower().replace("-", "")
-	if len(stem) <= 3:
+	if len(stem) <= 4:
 		return stem
 
-	prefixes = (
-		"pinag",
-		"pag",
-		"mag",
-		"nag",
-		"mapag",
-		"ma",
-		"na",
-		"ka",
-		"pa",
-		"maka",
-		"naka",
-		"tag",
-		"pang",
-		"pan",
-		"man",
-		"ipag",
-		"ika",
-		"ika",
-		"i",
-	)
-	for prefix in sorted(prefixes, key=len, reverse=True):
-		if len(stem) > len(prefix) + 2 and stem.startswith(prefix):
-			stem = stem[len(prefix) :]
-			break
-
-	if len(stem) > 4 and stem[1:3] == "um":
-		stem = stem[:1] + stem[3:]
-
-	suffixes = ("han", "hin", "an", "in", "ng", "na", "pa", "ma", "um", "en", "ed", "ing", "ly", "s")
-	for suffix in suffixes:
-		if len(stem) > len(suffix) + 2 and stem.endswith(suffix):
+	# Very small, safe suffix handling (do not remove if it would be too
+	# destructive).
+	# Keep only common English-like endings + plural 's'.
+	for suffix in ("s", "ed", "ing", "ly"):
+		if len(stem) >= len(suffix) + 4 and stem.endswith(suffix):
 			stem = stem[: -len(suffix)]
 			break
 
 	return stem
+
 
 
 def fetch_remote_text(url: str) -> str:
@@ -280,12 +276,21 @@ def load_tagalog_words() -> Set[str]:
 				"tama",
 			}
 
+	# The raymelon tagalog-dictionary-scraper provides a newline-delimited word list.
+	# Each line is expected to be a single Tagalog word (often already lowercase).
 	words: Set[str] = set()
-	for line in text.splitlines():
-		match = TAGALOG_LINE_RE.match(line)
-		if not match:
+	for raw_line in text.splitlines():
+		line = raw_line.strip()
+		if not line:
 			continue
-		entry = unescape(match.group(1)).lower()
+
+		# Backward compatibility: if the old dataset format is ever used, keep parsing it.
+		match = TAGALOG_LINE_RE.match(line)
+		if match:
+			entry = unescape(match.group(1)).lower()
+		else:
+			entry = unescape(line).lower()
+
 		for token in WORD_RE.findall(entry):
 			if len(token) > 1 or token.isalpha():
 				words.add(token)
@@ -382,8 +387,19 @@ class ModelingModule:
 		first_two = lower_token[:2]
 		length = len(lower_token)
 		pool: Set[str] = set()
-		primary_words = self.tagalog_word_list if language_hint == "tagalog" else self.english_word_list
-		secondary_words = self.english_word_list if language_hint == "tagalog" else self.tagalog_word_list
+
+		# Neutral pool if language is unknown.
+		if language_hint == "tagalog":
+			primary_words = self.tagalog_word_list
+			secondary_words = self.english_word_list
+		elif language_hint == "english":
+			primary_words = self.english_word_list
+			secondary_words = self.tagalog_word_list
+		else:
+			primary_words = self.tagalog_word_list | self.english_word_list
+			secondary_words = set()
+
+
 		for delta in (-2, -1, 0, 1, 2):
 			bucket_length = length + delta
 			if bucket_length <= 0:
@@ -400,18 +416,36 @@ class ModelingModule:
 		return list(pool)
 
 	def guess_language(self, token: str) -> str:
+
+		"""Return a language hint without over-biasing OOV tokens.
+
+		If the token (or its conservative stem) exists in a lexicon, prefer that
+		language. Otherwise return "unknown" so candidate ranking can use a
+		neutral pool.
+		"""
 		lower_token = token.lower()
 		if "-" in lower_token:
 			parts = [part for part in lower_token.split("-") if part]
 			if parts and self.is_tagalog_prefix(parts[0]):
 				return "tagalog"
-		return "tagalog" if self.contains_tagalog(lower_token) or self.contains_tagalog(simple_stem(lower_token)) else "english"
+
+		has_tag = self.contains_tagalog(lower_token) or self.contains_tagalog(simple_stem(lower_token))
+		has_eng = self.contains_english(lower_token) or self.contains_english(simple_stem(lower_token))
+
+		if has_tag and not has_eng:
+			return "tagalog"
+		if has_eng and not has_tag:
+			return "english"
+		return "unknown"
+
+
 
 	def is_tagalog_prefix(self, token: str) -> bool:
 		return token.lower() in self.tagalog_prefixes
 
 	def is_valid_hyphenated(self, token: str) -> bool:
 		parts = [part.lower() for part in token.split("-") if part]
+
 		if len(parts) != 2:
 			return False
 		left, right = parts
@@ -502,16 +536,20 @@ class ErrorDetectionModule:
 	def _rank_candidates(self, token: str, limit: int = 5) -> List[str]:
 		candidates = self.modeling.candidate_pool(token)
 		language_hint = self.modeling.guess_language(token)
+
 		preferred_words = self.modeling.tagalog_word_list if language_hint == "tagalog" else self.modeling.english_word_list
 		secondary_words = self.modeling.english_word_list if language_hint == "tagalog" else self.modeling.tagalog_word_list
 		scored: List[Tuple[int, float, float, str]] = []
 		phonetic_token = filipino_phonetic_code(token)
+
+		# Do NOT truncate early based on preferred/secondary membership.
+		# That can accidentally discard correct Tagalog candidates once a few
+		# non-preferred candidates fill the limit.
 		for candidate in candidates:
 			candidate_lower = candidate.lower()
 			if candidate_lower not in preferred_words and candidate_lower not in secondary_words:
 				continue
-			if candidate_lower not in preferred_words and len(scored) >= limit:
-				continue
+
 			distance = levenshtein_distance(token.lower(), candidate_lower)
 			if distance > 2:
 				continue
@@ -522,6 +560,7 @@ class ErrorDetectionModule:
 			scored.append(score)
 		scored.sort()
 		selected = [candidate for _, _, _, _, candidate in scored[:limit]]
+
 		if not selected:
 			fallback = [word for word in preferred_words if levenshtein_distance(token.lower(), word) <= 2]
 			return fallback[:limit]
