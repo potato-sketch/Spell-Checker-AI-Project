@@ -148,7 +148,7 @@ function scheduleLiveCheck() {
 
 inputText.addEventListener("input", function () {
   updateCounters();
-  scheduleLiveCheck();
+  // Real-time feature disabled: wait for manual Check
 });
 
 deleteBtn.addEventListener("click", function () {
@@ -179,8 +179,9 @@ copyBtn.addEventListener("click", async function () {
 });
 
 // Run in real-time via the input event; keep button hidden but functional if needed.
-checkBtn.style.display = "none";
-checkBtn.removeEventListener("click", checkText);
+checkBtn.style.display = "inline-flex";
+checkBtn.addEventListener("click", () => checkText({ source: "manual", silent: false }));
+
 
 suggestionsList.style.display = "none";
 emptyState.style.display = "block";
